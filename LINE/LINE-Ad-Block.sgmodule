@@ -1,0 +1,78 @@
+#!name=LINE Ad Block
+#!desc=Remove LINE in-app ads at the network layer (Surge iOS). Kills the ad-decision API (LEGY /ext/lgfp/lad + a.line.me/lgfp/lad) so no ad is ever fetched, plus creatives & third-party trackers. Path-scoped: never touches chat on the shared legy domain. Requires MITM (ad path is not cert-pinned; verified via APK network_security_config). Based on Android base.apk RE + iOS LINE 26.10.0 capture. Updated 2026-07-17.
+#!category=Ad Block
+#!author=SkyBlue997
+#!homepage=https://github.com/SkyBlue997/Surge
+#!system=ios
+
+# ===================================================================
+# Evidence base:
+#   Ad fetch (core):  legy-*.line-apps.com/ext/lgfp/lad/v1|v2   (native, via LEGY tunnel)
+#                     a.line.me/lgfp/lad/v1|v2                  (LINE NEWS WebView)
+#     Response JSON top-level ads[] (iOS/v1) / invs[] (Android/v2); empty array = "no ad".
+#     Client fails open on fetch error (RE: ho/C34890d onErrorReturn, Ro/C47212a onError),
+#     so a plain REJECT already yields "no ad" -- no forged response needed.
+#   Pixels:    a.line.me/er/lads/v1/ei , /er/lgfp/v1/event/image   (1x1 png)
+#   Creatives: ad.line-scdn.net , im.c.yimg.jp (Yahoo YDN) , static.line-scdn.net/ad-sdk|/lineads
+#   3rd party: doubleverify , appsflyer , dm.slim01.jp , googleads
+#
+# MITM feasibility (from decompiled res/xml/network_security_config.xml):
+#   Hard SPKI pinning is applied ONLY to bank/pay domains (*.linebk.com, *.kasikornbank.com,
+#   app-payatom.line-apps.com). The block holding legy.line-apps.com / line-scdn.net / a.line.me
+#   has NO <pin-set> (HTTPS-required only) -> not cert-pinned -> Surge MITM works.
+#
+# HARD RULE: legy-*.line-apps.com also carries chat /S4 /CH4 /WALLET4.
+#            Match ONLY the /ext/lgfp/lad path. NEVER blanket-block the legy domain.
+# ===================================================================
+
+[Rule]
+
+# ---- Tier 1: zero-risk, no MITM needed (whole-domain ad/tracker hosts) ----
+DOMAIN-SUFFIX,ad.line-scdn.net,REJECT-TINYGIF
+DOMAIN-SUFFIX,doubleverify.com,REJECT
+DOMAIN-SUFFIX,appsflyer.com,REJECT
+DOMAIN,dm.slim01.jp,REJECT
+DOMAIN-SUFFIX,googleads.g.doubleclick.net,REJECT
+DOMAIN-SUFFIX,googlesyndication.com,REJECT
+DOMAIN-SUFFIX,googleadservices.com,REJECT
+
+# ---- Tier 2: needs MITM, path-scoped (the actual ad killer) ----
+# 2D ad-decision API (native LEGY + NEWS WebView) -> no ad object reaches the client
+URL-REGEX,^https?:\/\/legy-[a-z0-9-]+\.line-apps\.com\/ext\/lgfp\/lad\/v[12],REJECT
+URL-REGEX,^https?:\/\/a\.line\.me\/lgfp\/lad\/v[12],REJECT
+# 2A impression pixels
+URL-REGEX,^https?:\/\/a\.line\.me\/er\/(lads|lgfp)\/,REJECT-TINYGIF
+# 2B web ad SDK JS + JIAA icons (static.line-scdn.net is shared CDN: path-scope only)
+URL-REGEX,^https?:\/\/static\.line-scdn\.net\/ad-sdk\/,REJECT
+URL-REGEX,^https?:\/\/static\.line-scdn\.net\/lineads\/,REJECT-TINYGIF
+# 2C Yahoo YDN ad creatives (im.c.yimg.jp is shared media domain: path-scope only)
+URL-REGEX,^https?:\/\/im\.c\.yimg\.jp\/res\/ydnstorage-media\/,REJECT-TINYGIF
+
+# ---- Tier 3: has breakage risk, disabled by default ----
+# a.line.me whole-domain: 100% ads in capture, but RE shows /oa /cs (Official Account / auth) traces
+# DOMAIN-SUFFIX,a.line.me,REJECT
+# LINE NEWS ad-slot layout: precise /ad_layout only, and add ch-news.line-apps.com to [MITM]
+# URL-REGEX,^https?:\/\/ch-news\.line-apps\.com\/capi\/tab\/ranking\/ad_layout,REJECT
+
+# ===================================================================
+# DO-NOT-BLOCK (content/functional, would break the app):
+#   gcs.line-scdn.net / gcs-beta.line-scdn-dev.net  = Home tab image CDN (content!)
+#   comtab-obs.line-scdn.net                         = OBS content thumbnails (content!)
+#   news-obs / vos / wcc-image / profile / gift-media / d / obs .line-scdn.net = content CDNs
+#   s.yimg.jp                                        = Yahoo video player JS (content, not ads!)
+#   ch-news body / uts-front (general telemetry) / apm.yahoo.co.jp (ad landing page) = leave alone
+# NOTE: capture is device-wide; *.baidu.com (Baidu IME), *.icloud-content.com are NOT LINE traffic.
+# ===================================================================
+
+[MITM]
+hostname = %APPEND% a.line.me, static.line-scdn.net, im.c.yimg.jp, legy-jp.line-apps.com, legy-tw.line-apps.com
+
+# ===================================================================
+# OPTIONAL (cleaner): rewrite the ad-fetch to an empty-ad 200 instead of REJECT, hitting the
+# client's graceful no-ad path with zero placeholder/retry. Replaces the two 2D REJECT lines.
+# Requires line-noads.js and handles the NEWS WebView CORS preflight. On iOS set script-path to a
+# reachable https URL hosting line-noads.js (e.g. the raw file in this repo). To enable: comment
+# out the two 2D URL-REGEX,REJECT lines above, then uncomment the [Script] block below.
+# [Script]
+# LINE-noads-fetch = type=http-request,pattern=^https?:\/\/(legy-[a-z0-9-]+\.line-apps\.com\/ext\/lgfp\/lad\/v[12]|a\.line\.me\/lgfp\/lad\/v[12]),requires-body=0,script-path=https://raw.githubusercontent.com/SkyBlue997/Surge/main/LINE/line-noads.js,timeout=10
+# ===================================================================
