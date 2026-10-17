@@ -128,6 +128,10 @@ function decodeEntities(s) {
     .replace(/&apos;/g, "'").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&");
 }
 const escapeXML = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// 去掉注音 (振假名): TTML 的 tts:ruby="text" 与 WebVTT 的 <rt>, 只保留正文送去翻译
+const stripRuby = (s) => s
+  .replace(/<((?:\w+:)?span)\b[^>]*\btts:ruby="text"[^>]*>[\s\S]*?<\/\1>/g, "")
+  .replace(/<rt\b[^>]*>[\s\S]*?<\/rt>/g, "");
 const cleanLines = (s) => s.split("\n").map((l) => l.replace(/[ \t ]+/g, " ").trim()).filter(Boolean).join("\n");
 
 function hash(str) {
@@ -160,7 +164,7 @@ const TTML = {
     let m;
     while ((m = re.exec(body))) {
       const inner = m[3];
-      const text = cleanLines(decodeEntities(inner.replace(/<(?:\w+:)?br\s*\/?>/g, "\n").replace(/<[^>]+>/g, "")));
+      const text = cleanLines(decodeEntities(stripRuby(inner).replace(/<(?:\w+:)?br\s*\/?>/g, "\n").replace(/<[^>]+>/g, "")));
       cues.push({ start: m.index + m[1].length, end: m.index + m[1].length + inner.length, inner, text });
     }
     return cues;
@@ -194,9 +198,13 @@ const VTT = {
       const lines = block.split(/\r?\n/);
       const ti = lines.findIndex((l) => l.includes("-->"));
       if (ti < 0) return;
-      const raw = lines.slice(ti + 1).join("\n");
-      const text = cleanLines(decodeEntities(raw.replace(/<[^>]+>/g, "")));
-      cues.push({ bi, head: lines.slice(0, ti + 1), raw, text });
+      // 文件末尾的换行会在最后一块留下空行, 单独保留, 否则译文会被空行隔断而不显示
+      const body = lines.slice(ti + 1);
+      const tail = [];
+      while (body.length && body[body.length - 1].trim() === "") tail.unshift(body.pop());
+      const raw = body.join("\n");
+      const text = cleanLines(decodeEntities(stripRuby(raw).replace(/<[^>]+>/g, "")));
+      cues.push({ bi, head: lines.slice(0, ti + 1), raw, tail, text });
     });
     return Object.assign(cues, { blocks, nl });
   },
@@ -206,7 +214,7 @@ const VTT = {
       const t = translations[i];
       if (!t) return;
       const textLines = combine(cue.raw, t, "\n").split("\n");
-      blocks[cue.bi] = cue.head.concat(textLines).join(nl);
+      blocks[cue.bi] = cue.head.concat(textLines, cue.tail).join(nl);
     });
     return blocks.join(nl + nl);
   },
@@ -475,10 +483,13 @@ async function main() {
   const body = typeof $response.body === "string" ? $response.body : "";
   const format = TTML.test(body) ? TTML : VTT.test(body) ? VTT : null;
   if (!format) {
-    log.debug("非字幕响应, 跳过");
+    const h = $response.headers || {};
+    const ct = h["Content-Type"] ?? h["content-type"] ?? "";
+    log.debug(`非字幕响应, 跳过: Content-Type=${ct}, 长度=${body.length}, 开头=${JSON.stringify(body.slice(0, 60))}`);
     return {};
   }
   const cues = format.parse(body);
+  log.info(`字幕格式: ${format === TTML ? "TTML" : "WebVTT"}, ${cues.length} 条`);
   const texts = cues.map((c) => c.text);
   if (!texts.some(Boolean)) return {};
   if (alreadyInTarget(texts, CONFIG.target, format.lang(body))) {
