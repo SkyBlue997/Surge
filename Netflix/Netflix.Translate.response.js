@@ -483,10 +483,13 @@ async function main() {
   const body = typeof $response.body === "string" ? $response.body : "";
   const format = TTML.test(body) ? TTML : VTT.test(body) ? VTT : null;
   if (!format) {
-    log.debug("非字幕响应, 跳过");
+    const h = $response.headers || {};
+    const ct = h["Content-Type"] ?? h["content-type"] ?? "";
+    log.debug(`非字幕响应, 跳过: Content-Type=${ct}, 长度=${body.length}, 开头=${JSON.stringify(body.slice(0, 60))}`);
     return {};
   }
   const cues = format.parse(body);
+  log.info(`字幕格式: ${format === TTML ? "TTML" : "WebVTT"}, ${cues.length} 条`);
   const texts = cues.map((c) => c.text);
   if (!texts.some(Boolean)) return {};
   if (alreadyInTarget(texts, CONFIG.target, format.lang(body))) {
