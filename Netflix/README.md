@@ -23,6 +23,8 @@ https://raw.githubusercontent.com/SkyBlue997/Surge/main/Netflix/DualSubs.Netflix
 
 没填 Key 或请求失败时，会弹出通知并显示原字幕，不会影响播放。
 
+如果在 Netflix 里直接选了目标语言的字幕（例如目标是简体中文，而你选了中文字幕），脚本会根据字幕的实际文字识别出来，不翻译、直接显示原字幕。识别以文字为准，字幕文件里声明的语言只在文字无法区分时（同为拉丁字母）作参考。
+
 ## 上下文翻译
 
 - 字幕按 `BatchSize` 条分批，一批台词在同一次请求里一起翻译。

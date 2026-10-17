@@ -90,19 +90,33 @@ function deeplSource(code) {
   return code.split("-")[0];
 }
 
-// 粗略判断字幕主要文字体系, 避免把中文字幕再"翻译"成中文
+// 按字幕实际文字判断语言: 返回 zh / ja / ko / km / latin, 无法判断时返回 undefined
+function detectScript(texts) {
+  const sample = texts.join("").slice(0, 20000);
+  const count = (re) => (sample.match(re) || []).length;
+  const letters = count(/\p{L}/gu);
+  if (letters < 10) return undefined;
+  const han = count(/[㐀-鿿豈-﫿]/g), kana = count(/[぀-ヿ]/g);
+  const hangul = count(/[가-힯ᄀ-ᇿ]/g), khmer = count(/[ក-៿]/g);
+  const latin = count(/[A-Za-zÀ-ɏ]/g);
+  if (kana / letters > 0.1) return "ja";
+  if (hangul / letters > 0.4) return "ko";
+  if (khmer / letters > 0.4) return "km";
+  if (han / letters > 0.4) return "zh";
+  if (latin / letters > 0.8) return "latin";
+  return undefined;
+}
+
+// 字幕已是目标语言时不翻译 (如在 Netflix 里直接选了中文字幕)。
+// 以实际文字为准: Netflix 的 TTML 声明的 xml:lang 不一定是字幕真实语言, 只在文字无法区分 (同为拉丁字母) 时参考
 function alreadyInTarget(texts, target, declaredLang) {
   const t = target.split("-")[0].toLowerCase();
-  if (declaredLang) return declaredLang.split("-")[0].toLowerCase() === t;
-  const sample = texts.join("").slice(0, 4000);
-  if (!sample) return false;
-  const count = (re) => (sample.match(re) || []).length;
-  const han = count(/[一-鿿]/g), kana = count(/[぀-ヿ]/g), hangul = count(/[가-힯]/g);
-  const letters = count(/[\p{L}]/gu) || 1;
-  if (t === "zh") return han / letters > 0.5 && kana / letters < 0.05;
-  if (t === "ja") return kana / letters > 0.2;
-  if (t === "ko") return hangul / letters > 0.5;
-  return false;
+  const detected = detectScript(texts);
+  log.info(`字幕语言检测: 文字=${detected ?? "未知"}, 声明=${declaredLang ?? "无"}, 目标=${t}`);
+  if (detected && detected !== "latin") return detected === t;
+  const declared = declaredLang ? declaredLang.split("-")[0].toLowerCase() : undefined;
+  if (detected === "latin") return ["zh", "ja", "ko", "km"].includes(t) ? false : declared === t;
+  return declared === t;
 }
 
 // ---------------------------------------------------------------- 文本工具
