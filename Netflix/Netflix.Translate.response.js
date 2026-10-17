@@ -3,7 +3,9 @@
 // 翻译器: OpenAI (Chat Completions, 兼容任意 OpenAI 格式接口) / Anthropic (Messages API) / DeepL。
 // 上下文: 字幕按批次翻译, 每批都会附带前后若干行原文作为上下文 (LLM 用于理解剧情/人称/语气;
 //         DeepL 走官方 context 参数, 不计费), 同时可通过 Hint 参数提供剧名、人名译法等背景信息。
-// 缓存: 同一份字幕 + 同一翻译配置的结果存入 $persistentStore, 拖动进度条/重新加载时不重复计费。
+// 限时: 播放器不会无限等待字幕, 超过 Timeout 秒仍未翻完时先返回已翻译的部分 (从开头往后翻)。
+// 缓存: 同一份字幕 + 同一翻译配置的结果存入 $persistentStore (含未翻完的部分),
+//       重新加载时只翻剩余的行, 不重复计费。
 
 const SCRIPT_NAME = "DualSubs Netflix";
 const CACHE_KEY = "DualSubs.Netflix.LLM.Cache";
@@ -14,20 +16,22 @@ const ARG_KEYS = [
   "OpenAIKey", "OpenAIModel", "OpenAIBaseURL", "OpenAIEffort",
   "AnthropicKey", "AnthropicModel", "AnthropicBaseURL", "AnthropicEffort",
   "DeepLKey", "DeepLBaseURL",
-  "ContextLines", "BatchSize", "Concurrency", "Hint", "CacheSize", "LogLevel",
+  "ContextLines", "BatchSize", "Concurrency", "Timeout", "Hint", "CacheSize", "LogLevel",
 ];
 const DEFAULTS = {
   Vendor: "OpenAI", Source: "AUTO", Target: "ZH-HANS", Position: "Forward", ShowOnly: "false",
   OpenAIKey: "", OpenAIModel: "gpt-5-mini", OpenAIBaseURL: "https://api.openai.com/v1", OpenAIEffort: "minimal",
   AnthropicKey: "", AnthropicModel: "claude-opus-5-5", AnthropicBaseURL: "https://api.anthropic.com", AnthropicEffort: "low",
   DeepLKey: "", DeepLBaseURL: "",
-  ContextLines: "8", BatchSize: "40", Concurrency: "4", Hint: "", CacheSize: "3", LogLevel: "WARN",
+  ContextLines: "8", BatchSize: "20", Concurrency: "16", Timeout: "30", Hint: "", CacheSize: "3", LogLevel: "WARN",
 };
 
 // 按已知键名切分, 允许值里出现 & 或 = (例如 Hint 里的说明文字)
 function parseArgument(raw) {
   const out = Object.assign({}, DEFAULTS);
   if (typeof raw !== "string" || !raw) return out;
+  // 兼容整段参数被引号包住的情况 (argument="...")
+  raw = raw.trim().replace(/^"([\s\S]*)"$/, "$1");
   const re = new RegExp(`(?:^|&)(${ARG_KEYS.join("|")})=`, "g");
   const hits = [];
   let m;
@@ -62,8 +66,9 @@ const CONFIG = {
   position: /^reverse$/i.test(ARGS.Position) ? "Reverse" : "Forward",
   showOnly: /^(true|1|yes)$/i.test(String(ARGS.ShowOnly)),
   contextLines: toInt(ARGS.ContextLines, 8, 0, 50),
-  batchSize: toInt(ARGS.BatchSize, 40, 1, 200),
-  concurrency: toInt(ARGS.Concurrency, 4, 1, 16),
+  batchSize: toInt(ARGS.BatchSize, 20, 1, 200),
+  concurrency: toInt(ARGS.Concurrency, 16, 1, 32),
+  timeout: toInt(ARGS.Timeout, 30, 5, 110),
   cacheSize: toInt(ARGS.CacheSize, 3, 0, 20),
   hint: String(ARGS.Hint || "").trim(),
 };
@@ -188,7 +193,7 @@ const TTML = {
 
 // WebVTT: 以空行分块, 含 "-->" 的块为字幕块, 时间轴之后的行为字幕文本
 const VTT = {
-  test: (body) => /^﻿?WEBVTT/.test(body),
+  test: (body) => /^\uFEFF?\s*WEBVTT/.test(body),
   lang: () => undefined,
   parse(body) {
     const nl = body.includes("\r\n") ? "\r\n" : "\n";
@@ -390,19 +395,24 @@ const Translators = {
 };
 
 // ---------------------------------------------------------------- 批处理
-function makeBatches(texts, size) {
+// 只为还没有译文的行分批; 上下文取自整份字幕里相邻的行 (含已翻译的)
+function makeBatches(texts, translations, size) {
   // DeepL 单次最多 50 条
   if (CONFIG.vendor === "DeepL") size = Math.min(size, 50);
-  const items = [];
-  texts.forEach((text, id) => { if (text) items.push({ id, text }); });
+  const ids = [];
+  texts.forEach((text, id) => { if (text) ids.push(id); });
+  const pos = {};
+  ids.forEach((id, p) => { pos[id] = p; });
+  const todo = ids.filter((id) => !translations[id]);
   const n = CONFIG.contextLines;
   const batches = [];
-  for (let i = 0; i < items.length; i += size) {
-    const slice = items.slice(i, i + size);
+  for (let i = 0; i < todo.length; i += size) {
+    const slice = todo.slice(i, i + size);
+    const first = pos[slice[0]], last = pos[slice[slice.length - 1]];
     batches.push({
-      items: slice,
-      before: items.slice(Math.max(0, i - n), i).map((it) => it.text),
-      after: items.slice(i + size, i + size + n).map((it) => it.text),
+      items: slice.map((id) => ({ id, text: texts[id] })),
+      before: ids.slice(Math.max(0, first - n), first).map((id) => texts[id]),
+      after: ids.slice(last + 1, last + 1 + n).map((id) => texts[id]),
     });
   }
   return batches;
@@ -421,12 +431,15 @@ async function runPool(tasks, limit) {
   return results;
 }
 
+// 认证/参数类错误重试也没用, 直接中止整份字幕
+const isFatal = (e) => e.fatal || [400, 401, 403, 404].includes(e.status);
+
 async function translateBatch(translator, batch) {
   let map = {};
   try {
     map = await translator(batch);
   } catch (e) {
-    if (e.fatal || (e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429)) throw e;
+    if (isFatal(e)) throw e;
     log.warn(`批次翻译失败, 重试一次: ${e.message}`);
     await new Promise((r) => setTimeout(r, 1000));
     map = await translator(batch);
@@ -444,14 +457,32 @@ async function translateBatch(translator, batch) {
   return map;
 }
 
-async function translateAll(texts) {
+async function translateAll(texts, prior) {
   const translator = Translators[CONFIG.vendor];
   if (!translator) throw Object.assign(new Error(`不支持的 Vendor: ${CONFIG.vendor}`), { fatal: true });
-  const batches = makeBatches(texts, CONFIG.batchSize);
-  log.info(`共 ${texts.length} 条字幕, ${batches.length} 批, 并发 ${CONFIG.concurrency}`);
-  const maps = await runPool(batches.map((b) => () => translateBatch(translator, b)), CONFIG.concurrency);
-  const merged = Object.assign({}, ...maps);
-  return texts.map((_, i) => (merged[i] ? cleanLines(merged[i]) : ""));
+  const result = prior ? prior.slice() : texts.map(() => "");
+  const batches = makeBatches(texts, result, CONFIG.batchSize);
+  log.info(`共 ${texts.length} 条字幕, 待翻译 ${batches.length} 批, 并发 ${CONFIG.concurrency}, 限时 ${CONFIG.timeout}s`);
+  let timedOut = false, lastError;
+  const pool = runPool(batches.map((b) => async () => {
+    if (timedOut) return;
+    try {
+      const map = await translateBatch(translator, b);
+      Object.keys(map).forEach((id) => { if (map[id]) result[id] = cleanLines(map[id]); });
+    } catch (e) {
+      if (isFatal(e)) throw e;
+      lastError = e;
+      log.warn(`批次翻译失败, 跳过 ${b.items.length} 行: ${e.message}`);
+    }
+  }), CONFIG.concurrency);
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => { timedOut = true; resolve(); }, CONFIG.timeout * 1000);
+  });
+  await Promise.race([pool, deadline]);
+  if (typeof clearTimeout === "function") clearTimeout(timer);
+  if (lastError && !result.some(Boolean)) throw lastError;
+  return { translations: result, timedOut };
 }
 
 // ---------------------------------------------------------------- 缓存
@@ -498,15 +529,26 @@ async function main() {
   }
 
   const sig = cacheSignature(texts);
+  const total = texts.filter(Boolean).length;
+  const countDone = (arr) => texts.filter((t, i) => t && arr[i]).length;
   let translations = cacheGet(sig);
-  if (translations && translations.length === texts.length) {
+  if (!translations || translations.length !== texts.length) translations = null;
+  if (translations && countDone(translations) >= total) {
     log.info("命中缓存");
   } else {
     const t0 = Date.now();
-    translations = await translateAll(texts);
-    const done = translations.filter(Boolean).length;
-    log.info(`翻译完成 ${done}/${texts.filter(Boolean).length}, 用时 ${Date.now() - t0}ms`);
+    const r = await translateAll(texts, translations);
+    translations = r.translations;
+    const done = countDone(translations);
+    const msg = `翻译完成 ${done}/${total}, 用时 ${Date.now() - t0}ms`;
     if (done) cachePut(sig, translations);
+    if (r.timedOut) {
+      log.warn(`${msg}, 已超过 ${CONFIG.timeout}s, 先返回已翻译部分`);
+      $notification.post(`🍿️ ${SCRIPT_NAME}`, `已翻译 ${done}/${total} 条, 其余显示原文`,
+        `${CONFIG.timeout} 秒内未翻完。重新选择字幕会继续翻译剩余部分; 也可调大 Concurrency 或换更快的模型。`);
+    } else {
+      log.info(msg);
+    }
   }
   return { body: format.build(body, cues, translations) };
 }

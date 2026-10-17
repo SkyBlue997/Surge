@@ -46,13 +46,15 @@ https://raw.githubusercontent.com/SkyBlue997/Surge/main/Netflix/DualSubs.Netflix
 | `AnthropicKey` / `AnthropicModel` / `AnthropicBaseURL` / `AnthropicEffort` | – / `claude-opus-5-5` / `https://api.anthropic.com` / `low` | 想要更快更便宜，可以换成 `claude-sonnet-5-5` 或 `claude-haiku-5-5` |
 | `DeepLKey` / `DeepLBaseURL` | – / 自动 | 以 `:fx` 结尾的 Key 自动走 Free 接口 |
 | `ContextLines` | `8` | 每批附带的前后上下文行数 |
-| `BatchSize` | `40` | 每批台词数（DeepL 最多 50） |
-| `Concurrency` | `4` | 并发请求数 |
+| `BatchSize` | `20` | 每批台词数（DeepL 最多 50） |
+| `Concurrency` | `16` | 同时发出的请求数 |
+| `Timeout` | `30` | 限时（秒），到时先返回已翻译的部分 |
 | `Hint` | 空 | 补充背景，不要包含英文双引号 |
 | `CacheSize` | `3` | 本地缓存集数，填 0 关闭 |
 | `LogLevel` | `WARN` | `OFF` / `ERROR` / `WARN` / `INFO` / `DEBUG` / `ALL` |
 
 ## 注意
 
-- 一集字幕通常有几百条，第一次加载要等所有批次翻译完（脚本超时 120 秒）。如果太慢，可以调大 `Concurrency`、换更快的模型，或调小 `BatchSize`。
+- 一集字幕通常有几百条，分成几十批同时翻译。播放器不会无限等待字幕：超过 `Timeout` 秒还没翻完时，先返回已翻译的部分（从开头往后），其余显示原文，并弹通知提示。已翻译的部分会缓存，再次选择这条字幕时只翻剩余部分。
+- 如果经常超时，可以调大 `Concurrency`、换更快的模型（如 `claude-haiku-5-5`），或调小 `BatchSize`。API 额度较低、频繁遇到 429 时调小 `Concurrency`。
 - 使用 Anthropic 官方接口和支持的模型时，脚本会开启服务端 `fallbacks: "default"`：请求被安全分类器拒绝时，由服务端自动换模型重试。
