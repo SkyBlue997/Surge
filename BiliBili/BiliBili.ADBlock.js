@@ -669,19 +669,26 @@ function handleGrpc(path) {
 	});
 	if (!changed) return undefined;
 	log.info(`${key}: 去除 ${changed} 项`);
-	const result = { body: grpcEncode(output) };
-	const headers = fixGrpcHeaders($response.headers);
-	if (headers) result.headers = headers;
-	return result;
+	return { body: grpcEncode(output) };
 }
 
-// 粉版客户端带 x-bili-moss-engine-type: 1 时要求响应头有 grpc-status
+// grpc.biliapi.net 把 grpc-status 放在 HTTP/2 trailer 里；Surge 为脚本缓存响应体后 trailer 会丢失，
+// 客户端收不到状态就会超时约 8 秒再改走 app.bilibili.com 重试。
+// 所以脚本处理过的 gRPC 响应，无论是否修改，都要在响应头补上 grpc-status。
+// 国际版 (bili-inter) 例外：它不接受响应头里的 grpc-status: 0
 function fixGrpcHeaders(headers) {
 	const req = $request.headers ?? {};
-	const moss = req["x-bili-moss-engine-type"] ?? req["X-Bili-Moss-Engine-Type"];
-	if (moss !== "1") return undefined;
-	const lower = Object.keys(headers ?? {}).map(k => k.toLowerCase());
-	if (lower.includes("grpc-status")) return undefined;
+	const ua = String(req["User-Agent"] ?? req["user-agent"] ?? "");
+	const key = Object.keys(headers ?? {}).find(k => k.toLowerCase() === "grpc-status");
+	if (ua.includes("bili-inter/")) {
+		if (key && headers[key] === "0") {
+			const out = { ...headers };
+			delete out[key];
+			return out;
+		}
+		return undefined;
+	}
+	if (key) return undefined;
 	return { ...headers, "grpc-status": "0" };
 }
 
@@ -902,13 +909,14 @@ function handleJson(host, path) {
 // 入口
 // ---------------------------------------------------------------------------
 
+const isGrpcResponse = () => /^application\/grpc/.test(String($response.headers?.["Content-Type"] ?? $response.headers?.["content-type"] ?? ""));
+
 function main() {
 	const match = /^https?:\/\/([^\/?#]+)([^?#]*)/.exec($request.url);
 	if (!match) return {};
 	const host = match[1].split(":")[0];
 	const path = match[2] || "/";
-	const contentType = String($response.headers?.["Content-Type"] ?? $response.headers?.["content-type"] ?? "").split(";")[0].trim();
-	if (contentType.startsWith("application/grpc")) return handleGrpc(path) ?? {};
+	if (isGrpcResponse()) return handleGrpc(path) ?? {};
 	return handleJson(host, path) ?? {};
 }
 
@@ -919,6 +927,11 @@ if (typeof $done === "function") {
 	} catch (e) {
 		log.error(`${$request.url.split("?")[0]}: ${e?.message ?? e}`);
 		result = {};
+	}
+	// 包括未修改、功能关闭、解析出错的情况
+	if (isGrpcResponse()) {
+		const headers = fixGrpcHeaders($response.headers);
+		if (headers) result.headers = headers;
 	}
 	$done(result);
 }
